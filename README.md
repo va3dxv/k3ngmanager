@@ -8,6 +8,6 @@ Simple tool to manage satellites and Kepler data on a K3NG rotator controller
 - Self contained, no installation required
 
 Written in Python
-Tested on Windows 10 Professional x64
+Tested on Windows 10 Professional x64 and Windows 10 Professional x86
 
 ![k3ngmanager](https://raw.githubusercontent.com/va3dxv/k3ngmanager/main/k3ngmanager.jpg)
