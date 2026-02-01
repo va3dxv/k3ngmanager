@@ -1,6 +1,5 @@
-#!/usr/local/bin/python3.9
+#!/usr/local/bin/python3.11
 #pyinstaller --onefile --windowed --icon=icon.ico -F k3ngmanager.py
-from distutils.command.upload import upload
 import wx
 import wx.grid
 from operator import itemgetter
@@ -10,9 +9,16 @@ import requests
 import serial
 import serial.tools.list_ports
 from wx.lib.embeddedimage import PyEmbeddedImage
-import threading
+from threading import Thread
+import json
+from datetime import datetime, timezone
+from sgp4.api import Satrec, days2mdhms
+from astropy.coordinates import TEME, ITRS, CartesianDifferential, CartesianRepresentation
+from astropy import units as u
+from astropy.time import Time
+from pytz import timezone
 
-class Kepler(wx.Panel):
+class MainPanel(wx.Panel):
     def __init__(self, parent, color, size):
         wx.Panel.__init__(self, parent=parent)
         self.parent=parent
@@ -20,59 +26,74 @@ class Kepler(wx.Panel):
         self.SetSize(size)
         self.SetMinSize(size=(size))
         self.SetMaxSize(size=(size))
-        self.saturl = 'https://www.amsat.org/tle/current/nasabare.txt'
+        self.amsaturl = 'https://www.amsat.org/tle/current/nasabare.txt'
+        self.tleurl = 'https://db.satnogs.org/api/tle/'
+        self.radiourl = 'https://db.satnogs.org/api/transmitters/'
+        self.saturl = 'https://db.satnogs.org/api/satellites/'
         self.cmdrefurl = 'https://raw.githubusercontent.com/wiki/k3ng/k3ng_rotator_controller/820-Command-Reference.md'
         self.userhome = os.getenv('USERPROFILE')
         self.apphome = f'{self.userhome}\\AppData\\Roaming\\k3ngmanager'
+        self.skyroofsatfile = f'{self.userhome}\\AppData\\Roaming\\Afreet\\Products\\SkyRoof\\Satellites.json'
+        self.skyroofsettings = f'{self.userhome}\\AppData\\Roaming\\Afreet\\Products\\SkyRoof\\Settings.json'
         if os.path.isdir(self.apphome) == False:
             os.makedirs(self.apphome)
-        self.satfile = f'{self.apphome}\\favorite.sats'
-        self.satnames = []
-        self.selectedsats = []
-        self.satlist = []
-        self.comports = {}
-        self.portslist = []
+        self.satfile = f'{self.apphome}\\autosave.tle'
+        self.satnames = [] # satellite names for drop down selection
+        self.selectedsats = [] # list of satellite dictionaries currently selected
+        self.satlist = [] # list of all satellite dictionaries
+        self.comports = {} # com ports dictionary
+        self.portslist = [] # list of com ports for drop down
         self.speedslist = ['1200','2400','4800','9600','14400','19200','38400','57600','115200']
         for comport in serial.tools.list_ports.comports():
             self.comports[comport.description] = comport.device
             self.portslist.append(comport.description)
 
-        self.cmddict = {'Enable/Disable Debug': '\D', 'Query Clock': '\?CL', 'GPS Sync Status': '\?GS', 'Query AZ/EL Position': 'C2', 'Read Loaded Sats': '\@', 'Erase Loaded Sats': '\!', 'Re-calc Sats': '\&', 'Ping Remote': '\PG', 'Query AZ Start': '\I', 'Query AZ Capability': '\J', 'Stop All Rotation': '\?SS', }
+        self.cmddict = {
+            'Enable/Disable Debug': '\D', 
+            'Park Antenna': '\P',
+            'Query Clock': '\?CL', 
+            'GPS Sync Status': '\?GS',
+            'Query GPS Location': '\?RC', 
+            'Query AZ/EL Position': 'C2', 
+            'Print Loaded Sats': '\@', 
+            'Erase Loaded Sats': '\!', 
+            'Re-calc Sats': '\&', 
+            'Ping Remote': '\PG', 
+            'Query AZ Start': '\I', 
+            'Query AZ Capability': '\J', 
+            'Stop All Rotation': '\?SS',
+            'Save EEPROM and restart': '\Q',
+            }
         self.cmdlist = list(self.cmddict.keys())
         self.connected = False
         self.debugon = False
+        self.tracking = False
+        self.skyroofpresent = False
+        self.getbutton = wx.Button(self, label='Fetch TLE\'s From Internet', pos=(20,5), size=(160,25))
+        self.getbutton.Bind(wx.EVT_BUTTON, self.getSats, self.getbutton, id=self.getbutton.GetId())
 
-        self.getbutton = wx.Button(self, label='Download', pos=(20,5), size=(160,25))
-        self.Bind(wx.EVT_BUTTON, self.GetSats, self.getbutton, id=self.getbutton.GetId())
-
-        self.updatebutton = wx.Button(self, label='Update These TLE\'s', pos=(20,5), size=(160,25))
-        self.Bind(wx.EVT_BUTTON, self.UpdateKeps, self.updatebutton, id=self.updatebutton.GetId())
+        self.updatebutton = wx.Button(self, label='Update TLE List', pos=(20,5), size=(160,25))
+        self.updatebutton.Bind(wx.EVT_BUTTON, self.updateTLEs, self.updatebutton, id=self.updatebutton.GetId())
         self.updatebutton.Hide()
 
-        self.loadbutton = wx.Button(self, label='Load Saved List', pos=(210,5), size=(110,25))
-        self.Bind(wx.EVT_BUTTON, self.LoadFile, self.loadbutton, id=self.loadbutton.GetId())
+        self.loadbutton = wx.Button(self, label='Load a Saved List', pos=(190,5), size=(110,25))
+        self.loadbutton.Bind(wx.EVT_BUTTON, self.loadFile, self.loadbutton, id=self.loadbutton.GetId())
 
-        self.clearbutton = wx.Button(self, label='Clear', pos=(800,5), size=(80,25))
-        self.Bind(wx.EVT_BUTTON, self.clearSel, self.clearbutton, id=self.clearbutton.GetId())
+        self.savebutton = wx.Button(self, label='Save this List', pos=(310,5), size=(110,25))
+        self.savebutton.Bind(wx.EVT_BUTTON, self.saveFile, self.savebutton, id=self.savebutton.GetId())
+
+        self.clearbutton = wx.Button(self, label='Clear', pos=(815,5), size=(80,25))
+        self.clearbutton.Bind(wx.EVT_BUTTON, self.clearSel, self.clearbutton, id=self.clearbutton.GetId())
 
         self.exitbutton = wx.Button(self, label='Exit', pos=(900,5), size=(80,25))
-        self.Bind(wx.EVT_BUTTON, self.exit, self.exitbutton, id=self.exitbutton.GetId())
+        self.exitbutton.Bind(wx.EVT_BUTTON, self.exit, self.exitbutton, id=self.exitbutton.GetId())
 
-        wx.StaticText(self, -1, 'Pick Satellite: ', pos=(20,42))
+        wx.StaticText(self, -1, 'Pick a Satellite: ', pos=(15,42))
         self.satchoice = wx.Choice(self, choices=self.satnames, pos=(100,40), size=(140,25))
 
-        self.addbutton = wx.Button(self, label='Add to List', pos=(250,40), size=(110,25))
-        self.Bind(wx.EVT_BUTTON, self.AddSat, self.addbutton, id=self.addbutton.GetId())
-
-        self.exportbutton = wx.Button(self, label='Save List', pos=(370,40), size=(110,25))
-        self.Bind(wx.EVT_BUTTON, self.ExportSats, self.exportbutton, id=self.exportbutton.GetId())
-
-        self.cmdlabel = wx.StaticText(self, -1, 'Commands: ', pos=(640,70))
-        self.cmdchoice = wx.Choice(self, choices=self.cmdlist, pos=(710,70))
-        self.cmdbutton = wx.Button(self, label='Send', pos=(900,70), size=(80,25))
-        self.Bind(wx.EVT_BUTTON, self.serialCommand, self.cmdbutton, id=self.cmdbutton.GetId())
-        self.cmdbutton.Disable()
-        self.cmdchoice.Disable()
+        self.addbutton = wx.Button(self, label='Add to List', pos=(245,40), size=(80,25))
+        self.addbutton.Bind(wx.EVT_BUTTON, self.selectSat, self.addbutton, id=self.addbutton.GetId())
+        self.addbutton.Disable()
 
         wx.StaticText(self, -1, 'COM Port: ', pos=(490,42))
         self.portchoice = wx.Choice(self, choices=self.portslist, pos=(550,40), size=(220,25))
@@ -81,15 +102,36 @@ class Kepler(wx.Panel):
         self.speedchoice = wx.Choice(self, choices=self.speedslist, pos=(830,40))
 
         self.connectbutton = wx.Button(self, label='Connect', pos=(900,40), size=(80,25))
-        self.Bind(wx.EVT_BUTTON, self.serialConnect, self.connectbutton, id=self.connectbutton.GetId())
+        self.connectbutton.Bind(wx.EVT_BUTTON, self.serialConnect, self.connectbutton, id=self.connectbutton.GetId())
 
-        self.debugbutton = wx.Button(self, label='Single Debug', pos=(900,40), size=(80,25))
-        self.Bind(wx.EVT_BUTTON, self.onetimeDebug, self.debugbutton, id=self.debugbutton.GetId())
-        self.debugbutton.Hide()
+        self.disconnectbutton = wx.Button(self, label='Disconnect', pos=(900,40), size=(80,25))
+        self.disconnectbutton.Bind(wx.EVT_BUTTON, self.serialDisconnect, self.disconnectbutton, id=self.disconnectbutton.GetId())
+        self.disconnectbutton.Hide()
 
-        self.uploadbutton = wx.Button(self, label='Upload to Controller', pos=(20,70), size=(120,25))
-        self.Bind(wx.EVT_BUTTON, self.UploadSats, self.uploadbutton, id=self.uploadbutton.GetId())
-        self.uploadbutton.Disable()
+        if os.path.isfile(self.skyroofsettings):
+            self.skyroofpresent = True
+            try:
+                with open(f'{self.skyroofsettings}', 'r', encoding = 'utf8') as file:
+                    self.skyroofsettings = json.load(file)
+                    self.skyroofgroups = self.skyroofsettings['Satellites']['SatelliteGroups']
+                file.close()
+                self.skyroofgrouplist = []
+                for satgroup in self.skyroofgroups:
+                    self.skyroofgrouplist.append(satgroup['Name'])
+                wx.StaticText(self, -1, 'SkyRoof Groups: ', pos=(15,72))
+                self.groupchoice = wx.Choice(self, choices=self.skyroofgrouplist, pos=(110,70), size=(140,25))
+                self.skyroofbutton = wx.Button(self, label='← Load From SkyRoof', pos=(255,70), size=(125,25))
+                self.skyroofbutton.Bind(wx.EVT_BUTTON, self.SkyRoof, self.skyroofbutton, id=self.skyroofbutton.GetId())
+
+            except Exception as error:
+                self.console.AppendText(f'\nError while processing SkyRoof Settings.json! - {error}\n')
+
+        self.cmdlabel = wx.StaticText(self, -1, 'Commands: ', pos=(660,72))
+        self.cmdchoice = wx.Choice(self, choices=self.cmdlist, pos=(735,70), size=(160,25))
+        self.cmdbutton = wx.Button(self, label='Send', pos=(900,70), size=(80,25))
+        self.cmdbutton.Bind(wx.EVT_BUTTON, self.serialCommand, self.cmdbutton, id=self.cmdbutton.GetId())
+        self.cmdbutton.Disable()
+        self.cmdchoice.Disable()
 
         self.satgridcounter = 0
         self.satgrid = wx.grid.Grid(self, size=(1000, 380), pos=(5,100))
@@ -104,32 +146,88 @@ class Kepler(wx.Panel):
         self.satgrid.SetColSize(1, 380)
         self.satgrid.SetColLabelValue(2, 'TLE2')
         self.satgrid.SetColSize(2, 380)
-        self.satgrid.Bind(wx.grid.EVT_GRID_CELL_RIGHT_CLICK, self.gridpopMenu)
+        self.satgrid.Bind(wx.grid.EVT_GRID_CELL_RIGHT_CLICK, self.gridContextMenu)
         self.satgrid.Bind(wx.EVT_KEY_DOWN, self.onKeyPress)
+        self.satgrid.Bind(wx.grid.EVT_GRID_CELL_LEFT_DCLICK, self.onDclick)
+
         self.console = wx.TextCtrl(self, -1, '', pos=(5,480), size=(1000,220), style=wx.TE_MULTILINE | wx.TE_READONLY)
+        self.consolefont = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_SEMIBOLD)
+        self.console.SetFont(self.consolefont)
 
-        self.autoLoadFile()
-
+        gridattr = wx.grid.GridCellAttr()
+        gridattr.SetFont(self.consolefont)
+        self.satgrid.SetColAttr(0, gridattr)
         wx.StaticText(self, -1, 'Custom Command: ', pos=(5,705))
-        self.cmdcustom = wx.TextCtrl(self, -1, '', pos=(115,702), size=(220,22), style=wx.TE_PROCESS_ENTER)
-        self.cmdcustombutton = wx.Button(self, label='Send', pos=(350,702), size=(80,22))
+        self.cmdcustom = wx.TextCtrl(self, -1, '', pos=(115,702), size=(220,25), style=wx.TE_PROCESS_ENTER)
+        self.cmdcustombutton = wx.Button(self, label='GO!', pos=(340,702), size=(80,25))
         self.Bind(wx.EVT_BUTTON, self.serialCommandCustom, self.cmdcustombutton, id=self.cmdcustombutton.GetId())
         self.Bind(wx.EVT_TEXT_ENTER, self.serialCommandCustom, id=self.cmdcustom.GetId())
         self.cmdcustom.Disable()
         self.cmdcustombutton.Disable()
 
-        self.stopbutton = wx.Button(self, label='STOP!', pos=(460,702), size=(80,22))
-        self.Bind(wx.EVT_BUTTON, self.stopcmd, self.stopbutton, id=self.stopbutton.GetId())
+        self.stopbutton = wx.Button(self, label='STOP!', pos=(430,702), size=(80,25))
+        self.stopbutton.Bind(wx.EVT_BUTTON, self.doStop, self.stopbutton, id=self.stopbutton.GetId())
         self.stopbutton.Disable()
 
-        self.refsbutton = wx.Button(self, label='Command Reference', pos=(580,702), size=(125,22))
-        self.Bind(wx.EVT_BUTTON, self.getcmdref, self.refsbutton, id=self.refsbutton.GetId())
+        self.debugbutton = wx.Button(self, label='Single Debug', pos=(520,702), size=(80,25))
+        self.debugbutton.Bind(wx.EVT_BUTTON, self.onetimeDebug, self.debugbutton, id=self.debugbutton.GetId())
+        self.debugbutton.Disable()
+
+        self.uploadbutton = wx.Button(self, label='Upload TLE\'s', pos=(610,702), size=(80,25))
+        self.uploadbutton.Bind(wx.EVT_BUTTON, self.uploadSats, self.uploadbutton, id=self.uploadbutton.GetId())
+        self.uploadbutton.Disable()
+
+        self.calbutton = wx.Button(self, label='Calibration Reference', pos=(740,702), size=(125,25))
+        self.calbutton.Bind(wx.EVT_BUTTON, self.calCommandRef, self.calbutton, id=self.calbutton.GetId())
+
+        self.refsbutton = wx.Button(self, label='Command Reference', pos=(880,702), size=(125,25))
+        self.refsbutton.Bind(wx.EVT_BUTTON, self.getCommandRef, self.refsbutton, id=self.refsbutton.GetId())
+
+        self.autoLoadFile()
+
+    def onDclick(self, event):
+        self.rowsel = event.GetRow()
+        self.viewSatDetail(self)
+
+    def viewSatDetail(self, event):
+        satname = self.satgrid.GetCellValue(self.rowsel, 0)
+        title = f'Detailed information for {satname}'
+        self.console.AppendText(f'\nFetching data for {satname}...\n')
+        self.noradid = self.satgrid.GetCellValue(self.rowsel, 1)[2:7]
+        try:
+            radioinfo = self.getRadioInfo()
+            satinfo = self.getSatInfo()
+        except IndexError as error:
+            message = 'Could not find satellite in database!'
+            self.showError(message, error)
+            return
+        tle = (self.satgrid.GetCellValue(self.rowsel, 1),self.satgrid.GetCellValue(self.rowsel, 2))
+        satFrame(self, title, tle, satinfo, radioinfo, self.color)
+
+    def onMouseOver(self, event):
+        prev_rowcol = [None,None]
+        def OnMouseMotion(event):
+            x, y = event.GetPosition()
+            row = self.satgrid.YToRow(y)
+            col = self.satgrid.XToCol(x)
+            try:
+                if (row,col) != prev_rowcol and row >= 0 and col >= 0:
+                    prev_rowcol[:] = [row,col]
+                    noradid=self.selectedsats[int(row)]['tle1'][2:7]
+                    satname=self.satgrid.GetCellValue(int(row), 0)
+                    self.satgrid.GetGridWindow().SetToolTip(f'{satname} (NORAD: {noradid})')
+            except IndexError as err:
+                self.satgrid.GetGridWindow().SetToolTip(f'') #ignore empty row at end of wxgrid
+                pass
+        event.Skip()
+        wx.EVT_MOTION(self.satgrid.GetGridWindow(), OnMouseMotion)
+        #self.satgrid.Bind(wx.EVT_MOTION, OnMouseMotion)
 
     def serialConnect(self, event):
         try:
             self.port = self.comports[self.portchoice.GetStringSelection()]
             self.baud = int(self.speedchoice.GetStringSelection())
-            self.console.AppendText(f'Opening {self.port}...\n')
+            self.console.AppendText(f'\nOpening {self.port}...\n')
             self.portchoice.Disable()
             self.speedchoice.Disable()
             self.connectbutton.Disable()
@@ -139,7 +237,7 @@ class Kepler(wx.Panel):
                 raise Exception('No baudrate selected!')
             self.serial = serial.Serial(self.port, self.baud, timeout=None)
             self.serial.flush()
-            self.consolethread = threading.Thread(target=self.serialThread, args=())
+            self.consolethread = Thread(target=self.serialThread, args=())
             self.consolethread.start()
             return
         except ValueError:
@@ -151,13 +249,39 @@ class Kepler(wx.Panel):
             self.connectbutton.Enable()
         except Exception as error:
             message = 'Error!'
+            error = 'Please select the correct COM port and baud rate.'
             self.showError(message, error)
-            self.console.AppendText(f'Can\'t open COM port!\n')
+            self.console.AppendText(f'\nCan\'t open COM port!\n')
             self.portchoice.Enable()
             self.speedchoice.Enable()
             self.connectbutton.Enable()
 
-    def UploadSats(self, event):
+    def serialDisconnect(self, event):
+        try:
+            if self.connected == True:
+                self.console.AppendText(f'Closing {self.port}.\n')
+                self.serial.write(b'\?SS\r')
+                self.serial.write(b'\^0\r')
+                time.sleep(2)
+                self.connected = False
+                self.serial.close()
+                self.connectbutton.Show()
+                self.debugbutton.Disable()
+                self.uploadbutton.Disable()
+                self.cmdchoice.Disable()
+                self.cmdbutton.Disable()
+                self.cmdcustom.Disable()
+                self.cmdcustombutton.Disable()
+                self.stopbutton.Disable()
+                self.disconnectbutton.Hide()
+                self.connectbutton.Show()
+                self.portchoice.Enable()
+                self.speedchoice.Enable()
+                self.connectbutton.Enable()
+        except:
+                pass
+
+    def uploadSats(self, event):
         try:
             filename = f'{self.apphome}\\kepfile.temp'
             if len(self.selectedsats) == 0:
@@ -168,9 +292,9 @@ class Kepler(wx.Panel):
                 raise Exception('Debugging is enabled. Please disable it first.')
             f = open(filename, 'w')
             for sat in self.selectedsats:
-                name = sat['Name']
-                line1 = sat[1]
-                line2 = sat[2]
+                name = sat['amsat_name']
+                line1 = sat['tle1']
+                line2 = sat['tle2']
                 f.write(f'{name}\r{line1}\r{line2}\r')
             f.close()
             with open(filename) as file:
@@ -178,7 +302,7 @@ class Kepler(wx.Panel):
             self.kepbytes = kepdata.encode('ascii')
             file.close()
             os.remove(filename)
-            self.writethread = threading.Thread(target=self.uploadThread, args=())
+            self.writethread = Thread(target=self.uploadThread, args=())
             self.writethread.start()
             return
         except Exception as error:
@@ -193,6 +317,10 @@ class Kepler(wx.Panel):
             self.serial.write(self.kepbytes)
             time.sleep(3)
             self.serial.write(b'\r\r')
+            if self.tracking == True:
+                time.sleep(5)
+                cmd = f'\${self.tracksatname}\r\^1\r'
+                self.serial.write(cmd.encode('ascii'))
             return
         except Exception as error:
             message = 'Error!'
@@ -201,20 +329,21 @@ class Kepler(wx.Panel):
     def serialThread(self):
         self.connected = True
         try:
-            self.console.AppendText(f'Waiting 5s for controller to initialize...\n')
+            self.console.AppendText(f'\nWaiting 5s for controller to initialize...\n')
             time.sleep(5)
-            self.console.AppendText(f'Requesting version...\n')
+            self.console.AppendText(f'\nRequesting version...\n')
             self.serial.write(b'\n\?CV\r')
             self.connectbutton.Hide()
-            self.debugbutton.Show()
+            self.debugbutton.Enable()
             self.uploadbutton.Enable()
             self.cmdchoice.Enable()
             self.cmdbutton.Enable()
             self.cmdcustom.Enable()
             self.cmdcustombutton.Enable()
             self.stopbutton.Enable()
+            self.disconnectbutton.Show()
             while self.connected == True:
-                time.sleep(0.1)
+                time.sleep(0.00001)
                 returntxt = self.serial.readline().decode('utf-8')
                 self.console.AppendText(returntxt)
             return
@@ -233,6 +362,8 @@ class Kepler(wx.Panel):
                     self.debugon = True
                 elif self.debugon == True:
                     self.debugon = False
+            if self.cmddict[cmdname] == '\?SS':
+                self.tracking = False
             cmd = f'{self.cmddict[cmdname]}\r'
             self.serial.write(cmd.encode('ascii'))
         except Exception as error:
@@ -250,6 +381,8 @@ class Kepler(wx.Panel):
                     self.debugon = True
                 elif self.debugon == True:
                     self.debugon = False
+            if cmd == '\?SS' or '\?ss':
+                self.tracking = False
             self.serial.write(cmd.encode('ascii'))
             self.serial.write(b'\r')
             self.cmdcustom.Clear()
@@ -267,40 +400,35 @@ class Kepler(wx.Panel):
             message = 'Error!'
             self.showError(message, error)
 
-    def stopcmd(self, event):
+    def doStop(self, event):
         try:
             if self.connected == False:
                 raise Exception('Not connected to serial port!')
             self.serial.flush()
             self.serial.write(b'\?SS\r')
+            self.console.AppendText('\nSent stop command.\n')
+            self.tracking = False
 
         except Exception as error:
             message = 'Error!'
             self.showError(message, error)
 
-    def UpdateKeps(self, event):
+    def updateTLEs(self, event):
         if self.satgridcounter == 0:
-            self.console.AppendText(f'\nNo selected satellites! You can pick satellite(s) from the drop-down list above, and click \"Add to List\", or you can load a previously saved list.\n')
+            self.console.AppendText(f'\nNo selected satellites! You can pick satellite(s) from the drop-down list above, and click \"Add to List\".\n\nOr you can load a previously saved list.\n')
+            if self.skyroofpresent == True:
+                self.console.AppendText(f'\nOr select a SkyRoof group and click \"Load From SkyRoof\".\n')
             return
-        self.console.AppendText(f'\nUpdating with kepler data from {self.saturl}...')
         updatednum = 0
-        netlist = []
-        r = requests.get(self.saturl)
-        blocks = r.text.split('\n')
-        for i in range(0, len(blocks), 3):
-                chunk = blocks[i:i + 3]
-                if len(chunk) == 1 and '' in chunk:
-                    break
-                netlist.append(dict(Name=chunk[0], One=chunk[1], Two=chunk[2]))
-                self.netsats = sorted(netlist, key=itemgetter('Name'))
         for idx, sat in enumerate(self.selectedsats, start=0):
-            for netsat in self.netsats:
-                if netsat['Name'] == sat['Name']:
-                    if sat[1] != netsat['One'] or sat[2] != netsat['Two']:
-                        sat.update({1: netsat['One']})
-                        sat.update({2: netsat['Two']})
-                        self.satgrid.SetCellValue(idx, 1, sat[1])
-                        self.satgrid.SetCellValue(idx, 2, sat[2])
+            noradid = sat['tle1'][2:7]
+            for newsat in self.satlist:
+                if int(noradid) == newsat['norad_cat_id']:
+                    if sat['tle1'] != newsat['tle1'] or sat['tle2'] != newsat['tle2']:
+                        sat.update({'tle1': newsat['tle1']})
+                        sat.update({'tle2': newsat['tle2']})
+                        self.satgrid.SetCellValue(idx, 1, sat['tle1'])
+                        self.satgrid.SetCellValue(idx, 2, sat['tle2'])
                         self.satgrid.SetCellBackgroundColour(idx, 1, (25,220,25))
                         self.satgrid.SetCellBackgroundColour(idx, 2, (25,220,25))
                         updatednum += 1
@@ -308,66 +436,205 @@ class Kepler(wx.Panel):
                         pass
                 else:
                     pass
-        netlist.clear()
         if updatednum >0:
-            self.console.AppendText(f'\nUpdated the kepler data for {updatednum} satellites.')
+            self.console.AppendText(f'\nUpdated the TLE\'s for {updatednum} of the {self.satgridcounter} satellites in your list. Ready to upload to K3NG controller!\n')
         else:
-            self.console.AppendText(f'\nFound no changes to kepler data for the current list.\n')
+            self.console.AppendText(f'\nFound no changes to TLE\'s for the current list. Ready to upload to K3NG controller!\n')
+        if self.connected == False:
+            self.console.AppendText(f'First select your serial port and baudrate, and click \"Connect\"! :)\n')
 
-    def GetSats(self, event):
-        self.console.AppendText(f'\nDownloading satellite list and kepler data from {self.saturl}...\n')
-        getlist = []
-        self.satlist = []
-        self.satnames = []
+    def getSats(self, event):
+        self.console.AppendText(f'\nDownloading satellite list and fresh TLE\'s from {self.amsaturl} and {self.tleurl}...\nPlease Wait...\n')
+        self.satlist = [] # the list of each 'new' sat as a dict
+        self.satnames = [] # list of sat names for the drop-down menu
         try:
-            r = requests.get(self.saturl)
-            blocks = r.text.split('\n')
-            for i in range(0, len(blocks), 3):
-                    chunk = blocks[i:i + 3]
-                    if len(chunk) == 1 and '' in chunk:
-                        break
-                    getlist.append(dict(Name=chunk[0], One=chunk[1], Two=chunk[2]))
-                    self.satlist = sorted(getlist, key=itemgetter('Name'))
-            
             self.satchoice.Destroy()
+            self.satlist = self.mergedSats()
             for sat in self.satlist:
-                self.satnames.append(sat['Name'])
-            self.satchoice = wx.Choice(self, choices=self.satnames, pos=(100,40), size=(140,30))
-            if self.cleargrid == True:
-                while len(self.selectedsats) > 0:
-                    for idx, sat in enumerate(self.selectedsats):
-                        self.satgridcounter -= 1
-                        self.selectedsats.pop(idx)
-                        self.satgrid.DeleteRows(idx)
-                self.satgridcounter = 0
-                self.selectedsats = []
-            self.console.AppendText(f'{len(self.satlist)} satellites downloaded.')# Click \"Update these TLE\'s\" to apply fresh TLE data to the selected sats before uploading to controller.\n')
-            if self.gotAutoLoad == True:
-                self.console.AppendText(f'\nKepler data for selected sats may be out of date. Click \"Update These TLE\'s\" before uploading to controller.\n')
+                self.satnames.append(sat['amsat_name'])
+            self.console.AppendText(f'\n{len(self.satlist)} satellites downloaded.\n')
+            if len(self.selectedsats) == 0:
+                self.console.AppendText(f'\nTo select satellites to upload to your controller, you can pick satellite(s) from the drop-down list above, and click \"Add to List\".\n\nOr you can load a previously saved list.\n')
+                if self.skyroofpresent == True:
+                    self.console.AppendText(f'\nOr select a SkyRoof group and click \"Load From SkyRoof\".\n')
             else:
-                self.console.AppendText(f'\nTo select satellites to upload to your controller, you can pick satellite(s) from the drop-down list above, and click \"Add to List\", or you can load a previously saved list.\n')
+                self.console.AppendText(f'\nTLE\'s may or may not be out of date for the {self.satgridcounter} satellites in your loaded list.\nBefore uploading to K3NG controller, click \"Update TLE List\".\nLines with updated data will be highlighted in green.\n')
             self.getbutton.Hide()
             self.updatebutton.Show()
-            getlist.clear()
+            self.addbutton.Enable()
+            self.satchoice = wx.Choice(self, choices=self.satnames, pos=(100,40), size=(140,30))
             self.Refresh()
+        except Exception as error:
+            self.satchoice = wx.Choice(self, choices=[], pos=(100,40), size=(140,25))
+            self.console.AppendText(f'\nError making API request to SatNogs!\n')
+            message = 'Error!'
+            self.showError(message, error)
+    
+    def mergedSats(self):
+        amsats = []
+        satlist = []
+        satnogs = []
+        r = requests.get(self.tleurl)
+        wx.Yield()
+        satnogs = json.loads(r.content.decode())
+        r = requests.get(self.amsaturl)
+        wx.Yield()
+        blocks = r.text.split('\n')
+        for i in range(0, len(blocks), 3):
+            chunk = blocks[i:i + 3]
+            if len(chunk) == 1 and '' in chunk:
+                break
+            amsats.append(dict(amsat_name=chunk[0], tle1=chunk[1], tle2=chunk[2]))
+        for nog in satnogs:
+            nog.update({'amsat_name': False})
+            for sat in amsats:
+                if str(nog['norad_cat_id']).zfill(5) == sat['tle2'][2:7]:
+                    nog['amsat_name'] = sat['amsat_name']
+                    satlist.append(dict(nog))
+            if nog['amsat_name'] == False:
+                nog['amsat_name'] = nog['tle0']
+                satlist.append(dict(nog))
+        self.satlist = sorted(satlist, key=itemgetter('amsat_name'))
+        return self.satlist
+
+    def autoLoadFile(self):
+        loadedlist = []
+        loadedsats = []
+        self.satgridcounter = 0
+        self.selectedsats = []
+        try:
+            with open(self.satfile) as textdata:
+                kepdata = textdata.read()
+                textdata.close()
+                blocks = kepdata.split('\n')
+                for i in range(0, len(blocks), 3):
+                    chunk = blocks[i:i + 3]
+                    if len(chunk) == 1 or '' in chunk:
+                        break
+                    else:
+                        loadedlist.append(dict(amsat_name=chunk[0], tle1=chunk[1], tle2=chunk[2]))
+                        loadedsats = sorted(loadedlist, key=itemgetter('amsat_name'))
+                for sat in loadedsats:
+                    thissat = {'amsat_name': sat['amsat_name'], 'tle1': sat['tle1'], 'tle2': sat['tle2']}
+                    self.fillGrid(self, thissat)
+                    self.selectedsats.append(thissat)
+            if self.satgridcounter == 0:
+                self.console.AppendText(f'\nClick \"Fetch TLE\'s From Internet\" to download satellite TLE data. Then pick a satellite to add to your list.\n\nOr click \'Load a Saved List\'.\n')
+                if self.skyroofpresent == True:
+                    self.console.AppendText(f'\nOr select a SkyRoof group and click \"Load From SkyRoof\".\n')
+            else:
+                self.console.AppendText(f'\n{self.satgridcounter} satellites loaded from auto-save file: {self.satfile}.\n')
+                self.console.AppendText(f'\nTLE\'s may or may not be out of date for the {self.satgridcounter} satellites in your auto-load list.\nClick \"Fetch TLE\'s From Internet\" to get fresh TLE\'s. Then, before uploading to K3NG controller, click \"Update TLE List\".\nLines with updated data will be highlighted in green.\n')
+            self.Refresh()
+            loadedlist.clear()
+            loadedsats.clear()
+
+        except FileNotFoundError as error:
+            self.console.AppendText(f'\nNo auto-save file yet - Welcome :)\n')
+            self.console.AppendText(f'\nClick \"Fetch TLE\'s From Internet\" to download satellite TLE data.\n')
+            if self.skyroofpresent == True:
+                self.console.AppendText(f'\nOr select a SkyRoof group and click \"Load From SkyRoof\".\n')
+        except Exception as error:
+            self.console.AppendText(f'\nProblem loading auto-save file. {error}\n')
+
+    def SkyRoof(self, event):
+        try:
+            skyroofselectedgroup = self.groupchoice.GetStringSelection()
+            if skyroofselectedgroup == '':
+                self.console.AppendText(f'\nSelect SkyRoof group from the drop down list first!\n')
+                return
+            while len(self.selectedsats) > 0:
+                for idx, sat in enumerate(self.selectedsats):
+                    self.satgridcounter -= 1
+                    self.selectedsats.pop(idx)
+                    self.satgrid.DeleteRows(idx)
+            self.satgridcounter = 0
+            self.selectedsats = [] # empty the list - to be filled with sats from the file we're loading
+            targetsats = []
+            for satgroup in self.skyroofgroups:
+                if satgroup['Name'] == skyroofselectedgroup:
+                    for satid in satgroup['SatelliteIds']:
+                        targetsats.append({'sat_id': satid})
+
+            with open(f'{self.skyroofsatfile}', 'r', encoding = 'utf8') as file:
+                satsjson = json.load(file)
+            file.close()
+            targetsatlookup = {d['sat_id']: d for d in targetsats}
+            for sat in satsjson:
+                if sat['sat_id'] in targetsatlookup:
+                    self.selectedsats.append({'amsat_name': sat['name'], 'tle1': sat['Tle']['tle1'], 'tle2': sat['Tle']['tle2']})
+                    self.fillGrid(self, {'amsat_name': sat['name'], 'tle1': sat['Tle']['tle1'], 'tle2': sat['Tle']['tle2']})
+            self.console.AppendText(f'\n{self.satgridcounter} satellites loaded from SkyRoof Group: {self.groupchoice.GetStringSelection()}.\n')
+            if self.satlist == []:
+                self.console.AppendText(f'\nTLE\'s may or may not be out of date for the {self.satgridcounter} satellites in SkyRoof {self.groupchoice.GetStringSelection()}.\nClick \"Fetch TLE\'s From Internet\" to get fresh TLE\'s. Then, before uploading to K3NG controller, click \"Update TLE List\".\nLines with updated data will be highlighted in green.\n')
+            else:
+                self.console.AppendText(f'\nTLE\'s may or may not be out of date for the {self.satgridcounter} satellites in SkyRoof {self.groupchoice.GetStringSelection()}.\nClick \"Update TLE List\" before uploading to K3NG controller.\nLines with updated data will be highlighted in green.\n')
+        except Exception as error:
+            self.console.AppendText(f'Error while processing SkyRoof Settings.json! - {error}\n')
+
+    def loadFile(self, event):
+        if self.satgridcounter != 0:
+            answer = wx.MessageBox('Warning! This will clear your current list. OK?', 'Confirm', wx.YES_NO | wx.CANCEL, self)
+            if answer == wx.YES:
+                pass
+            if answer == wx.NO:
+                return
+            if answer == wx.CANCEL:
+                return
+        while len(self.selectedsats) > 0:
+            for idx, sat in enumerate(self.selectedsats):
+                self.satgridcounter -= 1
+                self.selectedsats.pop(idx)
+                self.satgrid.DeleteRows(idx)
+        self.satgridcounter = 0
+        self.selectedsats = [] # empty the list - to be filled with sats from the file we're loading
+        try:
+            textfile = wx.FileSelector('Choose an input file...', default_extension='*.tle', wildcard='TLE files (*.tle)|*.tle')
+            with open(textfile) as text:
+                loadedlist = []
+                loadedsats = []
+                kepdata = text.read()
+                blocks = kepdata.split('\n')
+                for i in range(0, len(blocks), 3):
+                        chunk = blocks[i:i + 3]
+                        if len(chunk) == 1 and '' in chunk:
+                            break
+                        loadedlist.append(dict(amsat_name=chunk[0], tle1=chunk[1], tle2=chunk[2]))
+                        loadedsats = sorted(loadedlist, key=itemgetter('amsat_name'))
+            self.satchoice.Destroy()
+            for sat in loadedsats:
+                thissat = {'amsat_name': sat['amsat_name'], 'tle1': sat['tle1'], 'tle2': sat['tle2']}
+                self.fillGrid(self, thissat)
+                self.selectedsats.append(thissat)
+            self.console.AppendText(f'\nYou loaded {self.satgridcounter} satellites from {textfile}.\n')
+            if self.satlist == []:
+                self.console.AppendText(f'\nTLE\'s may or may not be out of date for the {self.satgridcounter} satellites in your loaded list.\nClick \"Fetch TLE\'s From Internet\" to get fresh TLE\'s. Then, before uploading to K3NG controller, click \"Update TLE List\".\nLines with updated data will be highlighted in green.\n')
+            else:
+                self.console.AppendText(f'\nTLE\'s may or may not be out of date for the {self.satgridcounter} satellites in your loaded list.\nClick \"Update TLE List\" before uploading to K3NG controller.\nLines with updated data will be highlighted in green.\n')
+            self.satchoice = wx.Choice(self, choices=self.satnames, pos=(100,40), size=(140,30))
+            loadedlist.clear()
+            loadedsats.clear()
+            self.Refresh()
+        except FileNotFoundError as error:
+            self.console.AppendText(f'Cancelled.\n')
         except Exception as error:
             message = 'Error!'
             self.showError(message, error)
 
-    def ExportSats(self, event):
+    def saveFile(self, event):
         try:
             if len(self.selectedsats) == 0:
                 raise Exception('No sats selected!')
-            dlg = wx.FileDialog(self, 'Save to file:', '.', '', 'Sats (*.sats)|*.sats', wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+            dlg = wx.FileDialog(self, 'Save to file:', '.', '', 'TLE files (*.tle|*.tle', wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
             if (dlg.ShowModal() == wx.ID_OK):
                 self.filename = dlg.GetFilename()
                 self.dirname = dlg.GetDirectory()
                 f = open(os.path.join(self.dirname, self.filename), 'w')
                 autosave = open(self.satfile, 'w')
                 for sat in self.selectedsats:
-                    name = sat['Name']
-                    line1 = sat[1]
-                    line2 = sat[2]
+                    name = sat['amsat_name']
+                    line1 = sat['tle1']
+                    line2 = sat['tle2']
                     f.write(f'{name}\r{line1}\r{line2}\r')
                     autosave.write(f'{name}\r{line1}\r{line2}\r')
                 f.close()
@@ -378,148 +645,52 @@ class Kepler(wx.Panel):
             message = 'Error!'
             self.showError(message, error)
 
-    def autoLoadFile(self):
-        self.cleargrid = False
-        loadedlist = []
-        self.satlist = []
-        self.loadedsats = []
-        self.satnames = []
-        self.getsats = []
-        while len(self.selectedsats) > 0:
-            for idx, sat in enumerate(self.selectedsats):
-                self.satgridcounter -= 1
-                self.selectedsats.pop(idx)
-                self.satgrid.DeleteRows(idx)
-        self.satgridcounter = 0
-        self.selectedsats = []
-        try:
-            with open(self.satfile) as textdata:
-                kepdata = textdata.read()
-                textdata.close()
-                blocks = kepdata.split('\n')
-                for i in range(0, len(blocks), 3):
-                        chunk = blocks[i:i + 3]
-                        if len(chunk) == 1 and '' in chunk:
-                            break
-                        loadedlist.append(dict(Name=chunk[0], One=chunk[1], Two=chunk[2]))
-                        self.loadedsats = sorted(loadedlist, key=itemgetter('Name'))
-            for sat in self.loadedsats:
-                thissat = {'Name': sat['Name'], 1: sat['One'], 2: sat['Two']}
-                self.satgrid.SetCellValue(self.satgridcounter,0,thissat['Name'])
-                self.satgrid.SetCellValue(self.satgridcounter,1,thissat[1])
-                self.satgrid.SetCellValue(self.satgridcounter,2,thissat[2])
-                self.satgrid.AppendRows(1)
-                self.satgridcounter += 1
-                self.selectedsats.append(thissat)
-            self.console.AppendText(f'{self.satgridcounter} satellites loaded from auto-save file: {self.satfile}.')
-            self.console.AppendText(f'\nClick \"Download\" to download fresh TLE data from the internet.\n')
-            self.Refresh()
-            self.gotAutoLoad = True
-        except FileNotFoundError as error:
-            self.console.AppendText(f'No auto-save file yet - Welcome :)')
-            self.console.AppendText(f'\nClick \"Download\" to download satellite TLE data from the internet.\n')
-            self.gotAutoLoad = False
-        except Exception as error:
-            self.console.AppendText(f'\nProblem loading auto-save file. {error}\n')
-
-    def LoadFile(self, event):
-        self.cleargrid = True
-        self.gotAutoLoad = False
-        while len(self.selectedsats) > 0:
-            for idx, sat in enumerate(self.selectedsats):
-                self.satgridcounter -= 1
-                self.selectedsats.pop(idx)
-                self.satgrid.DeleteRows(idx)
-        self.satgridcounter = 0
-        self.selectedsats = []
-        try:
-            textfile = wx.FileSelector('Choose an input file...', default_extension='*.sats', wildcard='SATS files (*.sats)|*.sats')
-            with open(textfile) as text:
-                loadedlist = []
-                self.satlist = []
-                self.loadedsats = []
-                self.satnames = []
-                self.getsats = []
-                kepdata = text.read()
-                blocks = kepdata.split('\n')
-                for i in range(0, len(blocks), 3):
-                        chunk = blocks[i:i + 3]
-                        if len(chunk) == 1 and '' in chunk:
-                            break
-                        loadedlist.append(dict(Name=chunk[0], One=chunk[1], Two=chunk[2]))
-                        self.loadedsats = sorted(loadedlist, key=itemgetter('Name'))
-            self.satchoice.Destroy()
-            for sat in self.loadedsats:
-                thissat = {'Name': sat['Name'], 1: sat['One'], 2: sat['Two']}
-                self.satgrid.SetCellValue(self.satgridcounter,0,thissat['Name'])
-                self.satgrid.SetCellValue(self.satgridcounter,1,thissat[1])
-                self.satgrid.SetCellValue(self.satgridcounter,2,thissat[2])
-                self.satgrid.AppendRows(1)
-                self.satgridcounter += 1
-                self.selectedsats.append(thissat)
-            self.console.AppendText(f'\nYou loaded {self.satgridcounter} satellites from {textfile}.')
-            self.console.AppendText(f'\nKepler data for selected sats may be out of date. Click \"Update These TLE\'s\" before uploading to controller.\n')
-            r = requests.get(self.saturl)
-            blocks = r.text.split('\n')
-            for i in range(0, len(blocks), 3):
-                    chunk = blocks[i:i + 3]
-                    if len(chunk) == 1 and '' in chunk:
-                        break
-                    self.getsats.append(dict(Name=chunk[0], One=chunk[1], Two=chunk[2]))
-                    self.satlist = sorted(self.getsats, key=itemgetter('Name'))
-            for sat in self.satlist:
-                self.satnames.append(sat['Name'])
-            self.satchoice = wx.Choice(self, choices=self.satnames, pos=(100,40), size=(140,30))
-            self.getbutton.Hide()
-            self.updatebutton.Show()
-            loadedlist.clear()
-            self.Refresh()
-        except FileNotFoundError as error:
-            self.console.AppendText(f'Cancelled.\n')
-        except Exception as error:
-            message = 'Error!'
-            self.showError(message, error)
-
     def clearSel(self, event):
-        self.cleargrid = True
-        self.gotAutoLoad = False
         while len(self.selectedsats) > 0:
             for idx, sat in enumerate(self.selectedsats):
                 self.satgridcounter -= 1
                 self.selectedsats.pop(idx)
                 self.satgrid.DeleteRows(idx)
-        self.satnames = []
-        self.satlist = []
-        self.selectedsats = []
+        self.satnames.clear()
+        self.satlist.clear()
+        self.selectedsats.clear()
         self.satchoice.Destroy()
         self.satchoice = wx.Choice(self, choices=self.satnames, pos=(100,40), size=(140,30))
         self.Refresh()
         self.updatebutton.Hide()
         self.getbutton.Show()
-        self.console.AppendText(f"\nCleared current list as well as downloaded data. Starting over.")
-        self.console.AppendText(f'\nClick \"Download\" to download satellite TLE data from the internet.\n')
+        self.addbutton.Disable()
+        self.console.AppendText(f'\nCleared current list as well as downloaded data. Starting over.\n')
+        self.console.AppendText(f'\nClick \"Fetch TLE\'s From Internet\" to download satellite TLE data. Then pick a satellite to add to your list.\n\nOr click \'Load a Saved List\'.\n')
+        if self.skyroofpresent == True:
+            self.console.AppendText(f'\nOr select a SkyRoof group and click \"Load From SkyRoof\".\n')
 
-    def AddSat(self, event):
+    def fillGrid(self, event, data):
+        self.satgrid.SetCellValue(self.satgridcounter,0,data['amsat_name'])
+        self.satgrid.SetCellValue(self.satgridcounter,1,data['tle1'])
+        self.satgrid.SetCellValue(self.satgridcounter,2,data['tle2'])
+        self.satgrid.AppendRows(1)
+        self.satgridcounter += 1
+        self.console.AppendText(f"\nAdded {data['amsat_name']}.\n")
+
+    def selectSat(self, event):
         try:
             if len(self.satnames) == 0:
                 raise Exception('Download sats first!')
-            if self.satgridcounter >= 18:
-                raise Exception('K3NG Rotator only holds 18 sats!')
+            # if self.satgridcounter >= 18:
+            #     raise Exception('K3NG Rotator only holds 18 sats!')
             satname = self.satchoice.GetStringSelection()
             if len(self.selectedsats) >0:
                 for sat in self.selectedsats:
-                    if satname == sat['Name']:
-                        raise Exception(f'{sat["Name"]} is already in list!')
+                    if satname == sat['amsat_name']:
+                        self.console.AppendText(f"\r{sat['amsat_name']} already in list!\n")
+                        raise Exception('Already in list!')
                     else:
                         pass
             for sat in self.satlist:
-                if sat['Name'] == satname:
-                    thissat = {'Name': sat['Name'], 1: sat['One'], 2: sat['Two']}
-                    self.satgrid.SetCellValue(self.satgridcounter,0,satname)
-                    self.satgrid.SetCellValue(self.satgridcounter,1,thissat[1])
-                    self.satgrid.SetCellValue(self.satgridcounter,2,thissat[2])
-                    self.satgrid.AppendRows(1)
-                    self.satgridcounter += 1
+                if sat['amsat_name'] == satname:
+                    thissat = {'amsat_name': sat['amsat_name'], 'tle1': sat['tle1'], 'tle2': sat['tle2']}
+                    self.fillGrid(self, thissat)
                     self.selectedsats.append(thissat)
         except Exception as error:
             message = 'Error!'
@@ -529,9 +700,23 @@ class Kepler(wx.Panel):
         try:
             if self.connected == False:
                 raise Exception('Not connected to controller!')
-            tracksatname = self.satgrid.GetCellValue(self.rowsel, 0)
-            cmd = f'\${tracksatname}\r\^1\r'
-            self.serial.write(cmd.encode('ascii'))
+            self.tracksatname = self.satgrid.GetCellValue(self.rowsel, 0)
+            self.noradid = self.satgrid.GetCellValue(self.rowsel, 1)[2:7]
+            answer = wx.MessageBox('Upload the current list of satellite TLE\'s to the controller first?\n\n(Not always necessary if uploaded recently, but if lists are not in sync you will have problems!)', 'Confirm', wx.YES_NO | wx.CANCEL, self)
+            if answer == wx.YES:
+                self.tracking = True
+                self.uploadSats(event)
+            if answer == wx.NO:
+                cmd = f'\${self.tracksatname}\r\^1\r'
+                self.serial.write(cmd.encode('ascii'))
+                self.tracking = True
+            if answer == wx.CANCEL:
+                return
+            title = f'Detailed information for {self.tracksatname}'
+            satinfo = self.getSatInfo()
+            radioinfo = self.getRadioInfo()
+            tle = (self.satgrid.GetCellValue(self.rowsel, 1),self.satgrid.GetCellValue(self.rowsel, 2))
+            satFrame(self, title, tle, satinfo, radioinfo, self.color)
             return
         except Exception as error:
             message = 'Error!'
@@ -542,6 +727,7 @@ class Kepler(wx.Panel):
             if self.connected == False:
                 raise Exception('Not connected to controller!')
             cmd = f'\^0\r'
+            self.tracking = False
             self.serial.write(cmd.encode('ascii'))
             return
         except Exception as error:
@@ -553,24 +739,28 @@ class Kepler(wx.Panel):
         title = 'Error'
         frame = errorFrame(message, error, title, self.color)
 
-    def gridpopMenu(self, event):
+    def gridContextMenu(self, event):
         self.gridmenu = wx.Menu()
         self.rowsel = event.GetRow()
-
-        self.menurem = wx.MenuItem(self.gridmenu, wx.ID_ANY, 'Remove from list')
-        self.menuprint = wx.MenuItem(self.gridmenu, wx.ID_ANY, 'Print list to console')
-        self.menustarttrack = wx.MenuItem(self.gridmenu, wx.ID_ANY, 'Track this Satellite')
-        self.menustoptrack = wx.MenuItem(self.gridmenu, wx.ID_ANY, 'Stop Sat Tracking')
-
+        self.satgrid.SelectRow(self.rowsel)
+        satrowname = self.satgrid.GetCellValue(self.rowsel, 0)
+        self.menuview = wx.MenuItem(self.gridmenu, wx.ID_ANY, f'(ENT) View {satrowname} Details')
+        self.menurem = wx.MenuItem(self.gridmenu, wx.ID_ANY, f'(DEL) Remove {satrowname} from list')
+        self.menuprint = wx.MenuItem(self.gridmenu, wx.ID_ANY, '(P)rint selected rows to console')
+        self.selectview = self.gridmenu.Append(self.menuview) 
         self.selectrem = self.gridmenu.Append(self.menurem)
         self.printlist = self.gridmenu.Append(self.menuprint)
-        self.tracksat = self.gridmenu.Append(self.menustarttrack)
-        self.trackstop = self.gridmenu.Append(self.menustoptrack)
-
-        self.Bind(wx.EVT_MENU, self.removerow, self.selectrem)
-        self.Bind(wx.EVT_MENU, self.printrows, self.menuprint)
-        self.Bind(wx.EVT_MENU, self.trackSat, self.menustarttrack)
-        self.Bind(wx.EVT_MENU, self.stopTrack, self.menustoptrack)
+        self.Bind(wx.EVT_MENU, self.viewSatDetail, self.selectview)
+        self.Bind(wx.EVT_MENU, self.removeRow, self.selectrem)
+        self.Bind(wx.EVT_MENU, self.printRows, self.menuprint)  
+        if self.tracking == False and self.connected == True:
+            self.menustarttrack = wx.MenuItem(self.gridmenu, wx.ID_ANY, f'Track {satrowname} on controller')
+            self.tracksat = self.gridmenu.Append(self.menustarttrack)
+            self.Bind(wx.EVT_MENU, self.trackSat, self.menustarttrack)                     
+        if self.tracking == True and self.connected == True:
+            self.menustoptrack = wx.MenuItem(self.gridmenu, wx.ID_ANY, f'Stop tracking {satrowname}')
+            self.trackstop = self.gridmenu.Append(self.menustoptrack)
+            self.Bind(wx.EVT_MENU, self.stopTrack, self.menustoptrack)
         self.PopupMenu(self.gridmenu)
 
     def sortVals(self,val):
@@ -592,17 +782,23 @@ class Kepler(wx.Panel):
                 self.satgrid.MoveCursorUp(expandSelection=False)
             self.satgrid.MoveCursorLeftBlock(expandSelection=True)
             self.satgrid.MoveCursorRightBlock(expandSelection=True)
-        if event.GetKeyCode() == 127: #delete key pressed
-            self.removerow(self)
+        if event.GetKeyCode() == 127: #delete
+            self.removeRow(self)
+        if event.GetKeyCode() == 80: #P
+            self.printRows(self)
+        if event.GetKeyCode() == 32: #space
+            pass
+        if event.GetKeyCode() == 13: #enter
+            self.viewSatDetail(self)
 
-    def removerow(self, event): # called when right click contextmenu "delete row"
+    def removeRow(self, event):
         selectedrows = self.satgrid.GetSelectedRows() # list of row numbers that are selected in wxgrid
         deleteus = [] # create list of rows to delete
         for row in selectedrows:
             try:
                 satname = self.satgrid.GetCellValue(row, 0) # get value of selected wxgrid row, from column 0
-                if self.selectedsats[row]['Name'] == satname: # find this row in the main dict and make sure it matches the item in wxgrid that we want to delete
-                    deleteme = {"gridrow": row, "sat": satname} # create dict for this row
+                if self.selectedsats[row]['amsat_name'] == satname: # find this row in the main dict and make sure it matches the item in wxgrid that we want to delete
+                    deleteme = {'gridrow': row, 'sat': satname} # create dict for this row
                     deleteus.append(deleteme) # add this dict to the list of rows to delete
                     deleteus.sort(key=self.sortVals, reverse=True)
             except IndexError as err:
@@ -613,20 +809,28 @@ class Kepler(wx.Panel):
             self.satgrid.DeselectRow(deleteme['gridrow']) # deselect the deleted row
             self.selectedsats.pop(deleteme['gridrow']) # pop this row from the list of row dicts
             self.satgridcounter -= 1 # deccrease my row counter down by 1
-            self.console.AppendText(f"Deleting {deleteme['sat']}.\r") # prints each item in the each row that was selected
+            self.console.AppendText(f"\nDeleting {deleteme['sat']}.\n") # prints each item that was selected
         self.satgrid.Refresh() # refresh the grid
-        self.console.AppendText(f"Deleted {len(deleteus)} sats from list. {self.satgridcounter} remaining.\r")
+        self.console.AppendText(f'\nDeleted {len(deleteus)} sats from list. {self.satgridcounter} remaining.\n')
         deleteus.clear() # finished with dict of rows to be deleted
 
-    def printrows(self, event):
+    def printRows(self, event):
+        selectedrows = self.satgrid.GetSelectedRows()
         self.console.AppendText(f'\r')
-        for idx, sat in enumerate(self.selectedsats):
-            self.console.AppendText(f'\n{sat["Name"]}')
-            self.console.AppendText(f'\n{sat[1]}')
-            self.console.AppendText(f'\n{sat[2]}')
+        for row in selectedrows:
+            if int(row) >= len(self.selectedsats):
+                self.satgrid.DeselectRow(row)
+                return
+            else:
+                satname = self.satgrid.GetCellValue(row, 0)
+                tle1 = self.satgrid.GetCellValue(row, 1)
+                tle2 = self.satgrid.GetCellValue(row, 2)
+                self.console.AppendText(f'{satname}\n')
+                self.console.AppendText(f'{tle1}\n')
+                self.console.AppendText(f'{tle2}\n')
         self.console.AppendText(f'\r')
 
-    def getcmdref(self, event):
+    def getCommandRef(self, event):
         try:
             r = requests.get(self.cmdrefurl)
             self.console.AppendText(f'\r{r.text}\r\r')
@@ -635,38 +839,99 @@ class Kepler(wx.Panel):
             message = 'Error!'
             self.showError(message, error)
 
+    def calCommandRef(self, event):
+        self.calhelp = """ ### Common Calibration Commands. See full Command Reference for more.
+            \I              - display the current az starting point (usually 0 or 180)
+            \J              - display the current az rotation capability (usually 360 or 450)
+
+            \Ix[x][x]               - set az starting point (Eg: \I180)
+            \Jx[x][x]               - set az rotation capability (Eg: \J360)
+
+            \Ax[xxx][.][xxxx]           - manually calibrate azimuth
+            \Ax[x][x]                   - manually calibrate azimuth (Rotary Encoder & Pulse Input features)
+            \Bx[xxx][.][xxxx]           - manually calibrate elevation
+            \Bx[x][x]                   - manually calibrate elevation (Rotary Encoder & Pulse Input features)
+
+            \P                      - park antenna
+            \PA[x][x][x]            - set / query park azimuth (Eg: \PA180)
+            \PE[x][x][x]            - set / query park elevation (Eg \PE0)
+
+            \?AZ                    - query azimuth
+            \?AS                    - query azimuth rotation status
+            \?EL                    - query elevation
+            \?ES                    - query elevation rotation status
+            \?AO                    - azimuth full CCW calibration      (Alpha Oscar, not A zero)
+            \?AF                    - azimuth full CW calibration
+            \?EO                    - elevation full DOWN calibration   (Echo Oscar, not E zero)
+            \?EF                    - elevation full UP calibration
+
+            \+                  - azimuth LCD display mode switch: normal, raw degrees, +overlap            
+            \Q                  - Save settings in the EEPROM and restart
+            \X0                 - clear calibration to defaults
+            
+        """
+        self.console.AppendText(f'\n{self.calhelp}\n')
+
+    def getSatTLE(self):
+        id = int(self.noradid)
+        r = requests.get(f"{self.tleurl}?norad_cat_id={id}")
+        sat = json.loads(r.content.decode())
+        return sat
+
+    def getRadioInfo(self):
+        radiolist = []
+        id = int(self.noradid)
+        r = requests.get(f"{self.radiourl}?satellite__norad_cat_id={id}")
+        radios = json.loads(r.content.decode())
+        for radio in radios:
+            radiolist.append(radio)
+        return radiolist
+
+    def getSatInfo(self):
+        id = int(self.noradid)
+        r = requests.get(f"{self.saturl}?norad_cat_id={id}")
+        satinfo = json.loads(r.content.decode())
+        return dict(satinfo[0])
+
     def exit(self, event):
         self.console.AppendText(f'\r\nShutting down...\r\n')
         try:
-            if len(self.selectedsats) == 0:
-                pass
             autosave = open(self.satfile, 'w')
             for sat in self.selectedsats:
-                name = sat['Name']
-                line1 = sat[1]
-                line2 = sat[2]
+                name = sat['amsat_name']
+                line1 = sat['tle1']
+                line2 = sat['tle2']
                 autosave.write(f'{name}\r{line1}\r{line2}\r')
             autosave.close()
             self.console.AppendText(f'\nAuto-saved current list to {self.satfile}\r\n')
-        except:
+        except len(self.selectedsats) == 0:
             pass
-        if self.connected == False:
-            self.parent.Destroy()
-        else:
-            self.console.AppendText(f'Closing {self.port}.\n')
-            self.serial.write(b'\?SS\r')
-            self.serial.write(b'\^0\r')
-            time.sleep(2)
-            self.connected = False
-            self.serial.close()
-            self.parent.Destroy()
+
+        try:
+            if self.connected == True:
+                self.console.AppendText(f'Closing {self.port}.\n')
+                self.serial.write(b'\?SS\r')
+                self.serial.write(b'\^0\r')
+                time.sleep(2)
+                self.connected = False
+                self.serial.close()
+        except:
+                pass
+
+        self.Destroy()
+        self.parent.Destroy()
 
 class errorFrame(wx.Dialog):
     def __init__(self, message, error, title, color, parent=None):
-        wx.Dialog.__init__(self, parent=parent, title=title, style=wx.STAY_ON_TOP)
+        pos = wx.GetMousePosition()
+        newpos = list(pos)
+        newpos[0] -= 200
+        newpos[1] -= 75
+        pos=tuple(newpos)        
+        wx.Dialog.__init__(self, parent=parent, title=title, pos=pos, style=wx.STAY_ON_TOP)
         self.color = color
         self.errorpage = wx.Panel(self)
-        size=(340,240)
+        size=(340,200)
         self.SetSize(size)
         self.SetMinSize(size=size)
         self.SetMaxSize(size=size)
@@ -675,9 +940,102 @@ class errorFrame(wx.Dialog):
         self.messagetext.Wrap(300)
         self.errortext = wx.StaticText(self.errorpage, -1, f'{error}', pos=(10, 60))
         self.errortext.Wrap(300)
-        self.okbutton = wx.Button(self.errorpage, label='OK', pos=(120, 180), size=(70, 40))
-        self.Bind(wx.EVT_BUTTON, self.okay)
+        self.okbutton = wx.Button(self.errorpage, label='OK', pos=(20, 140), size=(70, 40))
+        self.okbutton.Bind(wx.EVT_BUTTON, self.okay)
         self.Show()
+
+    def okay(self, event):
+        self.Destroy()
+
+class satFrame(wx.Frame):
+    def __init__(self, event, title, tle, satinfo, radioinfo, color):
+        pos = wx.GetMousePosition()
+        newpos = list(pos)
+        newpos[0] -= 450
+        newpos[1] -= 10
+        pos=tuple(newpos)
+        wx.Frame.__init__(self, None, title=title, pos=pos)
+        self.color = color
+        self=self
+        self.panel = wx.Panel(self)
+        self.SetIcon(MainFrame.appIcon(self))
+        self.SetMinSize((900,500))
+        self.SetMaxSize((900,500))
+        self.SetBackgroundColour(self.color)
+        tz = timezone('UTC')
+        now = datetime.now(tz)
+        julian = Time(now)
+        satellite = Satrec.twoline2rv(tle[0], tle[1])
+        e, r, v = satellite.sgp4(julian.jd1,julian.jd2)
+        if e != 0:
+            pass
+        r = CartesianRepresentation(r*u.km)
+        v = CartesianDifferential(v*u.km/u.s)
+        year = satellite.epochyr
+        month, day, hour, minute, second = days2mdhms(satellite.epochyr, satellite.epochdays)
+        epoch = datetime.strptime(f'{year} {month} {day} {hour} {minute} {second}', '%y %m %d %H %M %S.%f')
+        formatedepoch = datetime.strftime(epoch, "%Y-%m-%d %H:%M:%S")
+        teme = TEME(r.with_differentials(v), obstime=julian)
+        itrs_geo = teme.transform_to(ITRS(obstime=julian))
+        location = itrs_geo.earth_location
+        lat = str(location.geodetic.lat.to_value())
+        lon = str(location.geodetic.lon.to_value())
+        alt = str(location.geodetic.height.to_value())
+        alt = '{:.8}'.format(alt)
+        lat = '{:.8}'.format(lat)
+        lon = '{:.8}'.format(lon)
+
+        satupdated = datetime.strftime(datetime.strptime(satinfo['updated'], '%Y-%m-%dT%H:%M:%S.%fZ'), '%Y-%m-%d %H:%M:%S')
+        header = f"Name(s): {satinfo['name']} (aka {satinfo['names']}) --- Status: {satinfo['status']}\nSat ID: {satinfo['sat_id']} --- NORAD: {satinfo['norad_cat_id']}\nCurrent position: lat: {lat} / lon: {lon} / alt: {alt}\nOrbital data most accurate at: {formatedepoch} UTC --- Status of radios updated: {satupdated} UTC"
+        font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_SEMIBOLD)
+        textd = wx.StaticText(self, -1, header, pos=(5, 5))
+        textd.SetFont(font)
+        self.radgrid = wx.grid.Grid(self, size=(880, 370), pos=(5,90))
+        self.radgrid.CreateGrid(1,7)
+        self.radgrid.EnableEditing(0)
+        self.radgrid.EnableDragRowSize(0)
+        self.radgrid.EnableDragGridSize(0)
+        self.radgrid.SetSelectionMode(wx.grid.Grid.SelectRows)
+        self.radgrid.SetColLabelValue(0, 'Description')
+        self.radgrid.SetColSize(0, 240)
+        self.radgrid.SetColLabelValue(1, 'Uplink')
+        self.radgrid.SetColSize(1, 100)
+        self.radgrid.SetColLabelValue(2, 'Downlink')
+        self.radgrid.SetColSize(2, 100)
+        self.radgrid.SetColLabelValue(3, 'Mode')
+        self.radgrid.SetColSize(3, 120)
+        self.radgrid.SetColLabelValue(4, 'Invert')
+        self.radgrid.SetColSize(4, 70)
+        self.radgrid.SetColLabelValue(5, 'Status')
+        self.radgrid.SetColSize(5, 70)
+        self.radgrid.SetColLabelValue(6, 'Updated')
+        self.radgrid.SetColSize(6, 80)
+        self.Bind(wx.EVT_CLOSE, self.okay)
+        self.panel.Fit()
+        self.Layout()
+        self.Fit()
+        self.Show()
+
+        for idx,radio in enumerate(radioinfo):
+            try:
+                upfreq = radio['uplink_low'] / 1000000
+                upfreq = format(upfreq, '.3f')
+            except:
+                upfreq = radio['uplink_low']
+            try:
+                downfreq = radio['downlink_low'] / 1000000
+                downfreq = format(downfreq, '.3f')
+            except:
+                downfreq = radio['downlink_low']
+            self.radgrid.SetCellValue(idx,0,radio['description'])
+            self.radgrid.SetCellValue(idx,1,f'{str(upfreq)} MHz')  
+            self.radgrid.SetCellValue(idx,2,f'{str(downfreq)} MHz')
+            self.radgrid.SetCellValue(idx,3,radio['mode'])
+            self.radgrid.SetCellValue(idx,4,str(radio['invert']))
+            self.radgrid.SetCellValue(idx,5,radio['status'])
+            self.radgrid.SetCellValue(idx,6,datetime.strftime(datetime.strptime(radio['updated'], '%Y-%m-%dT%H:%M:%S.%fZ'), '%Y-%m-%d'))
+            self.radgrid.AppendRows()
+            self.radgridrows = idx
 
     def okay(self, event):
         self.Destroy()
@@ -685,20 +1043,21 @@ class errorFrame(wx.Dialog):
 class MainFrame(wx.Frame):
     def __init__(self):
         self.appName='K3NG Rotator Manager by VA3DXV'
-        self.appVersion=0.4
-        size=(1024,768)
-        frameTitle = (f'{self.appName} version {self.appVersion}')
-        wx.Frame.__init__(self, None, title=frameTitle, size=size)
+        self.appVersion=0.5
+        self.size=(1024,768)
+        self.frameTitle = (f'{self.appName} version {self.appVersion}')
+        wx.Frame.__init__(self, None, title=self.frameTitle, size=self.size)
+        self.Bind(wx.EVT_CLOSE, self.exit)
         self.SetIcon(self.appIcon())
-        self.SetMinSize(size)
-        self.SetMaxSize(size)
+        self.SetMinSize(self.size)
+        self.SetMaxSize(self.size)
         self.color = (255,255,255)
         self.SetBackgroundColour(self.color)
-        self.panel = Kepler(self, self.color, size)
-        self.Bind(wx.EVT_CLOSE, self.exit)
+        self.panel = MainPanel(self, self.color, self.size)
         self.Show()
 
     def exit(self, event):
+        self.panel.console.AppendText(f'\nPlease use the \"Exit\" button to gracefully close the application.\n')
         return
 
     def appIcon(self):

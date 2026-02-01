@@ -1,2 +1,5 @@
 dist/*
 build/*
+.vscode/*
+.venv/*
+scraps/*

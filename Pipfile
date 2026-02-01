@@ -10,6 +10,11 @@ attrdict3 = "*"
 wxpython = "*"
 pyserial = "*"
 pyinstaller = "*"
+matplotlib = "*"
+sgp4 = "*"
+astropy = "*"
+pytz = "*"
+basemap = "*"
 
 [dev-packages]
 
